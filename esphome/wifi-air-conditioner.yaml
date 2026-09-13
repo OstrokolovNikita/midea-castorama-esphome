@@ -1,0 +1,1113 @@
+# ============================================================
+# MIDEA / CASTORAMA
+# ESP32-C3 Super Mini
+# v1.4 FINAL
+# Base: physically verified v1.2.
+# Added only stable persistent mute handling.
+#
+# Changes:
+# - HEAT_COOL in HA = AUTO mode (kept enabled)
+# - fan speed is remembered across mode changes
+# - DRY/AUTO may physically force AUTO fan, but the last normal
+#   fan speed is remembered and restored when returning to
+#   COOL / HEAT / FAN_ONLY
+# - COOL -> HEAT always sets 30°C
+# - HEAT -> COOL always sets 25°C
+#
+# GPIO20 = BLUE   CN18 MAIN -> DISPLAY
+# GPIO4  = YELLOW CN18 DISPLAY -> MAIN
+# GPIO6  = IR injection through A09T/AO3400-type N-MOSFET
+# ============================================================
+
+esphome:
+  name: wifi-air-conditioner
+  friendly_name: Wifi air conditioner
+
+esp32:
+  variant: esp32c3
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  baud_rate: 0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "Wifi air condit Fallback Hotspot"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+# ============================================================
+# CONFIRMED / REMEMBERED STATE
+#
+# confirmed_mode:
+#   0 = OFF
+#   1 = AUTO / HEAT_COOL
+#   2 = COOL
+#   3 = HEAT
+#   4 = FAN_ONLY
+#   5 = DRY
+#
+# confirmed_fan / preferred_fan:
+#   0 = AUTO
+#   1 = LOW
+#   2 = MEDIUM
+#   3 = HIGH
+# ============================================================
+
+globals:
+  - id: confirmed_mode
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: confirmed_temperature
+    type: float
+    restore_value: yes
+    initial_value: '24.0'
+
+  - id: confirmed_fan
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: preferred_fan
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: confirmed_swing
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+
+  # Persistent user preference. True means: after each real power-on,
+  # disable front display / buzzer with the proven Coolix toggle B5F5A5.
+  - id: mute_desired
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # Runtime physical state for the current AC ON session.
+  # Cleared on every real OFF. Set when we send/observe B5F5A5 while ON.
+  - id: mute_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # True only while our own B5F5A5 transmission is awaiting the YELLOW
+  # confirmation frame. Prevents treating our confirmation as an external toggle.
+  - id: mute_tx_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Short guard against the transient/all-zero BLUE state while the display
+  # is being blanked or restored by B5F5A5.
+  - id: mute_ignore_zero_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+# ============================================================
+# IR INJECTION
+# ============================================================
+
+remote_transmitter:
+  id: ac_ir_tx
+
+  pin:
+    number: GPIO6
+    inverted: false
+
+  carrier_duty_percent: 100%
+
+# ============================================================
+# DISPLAY / SOUND
+# ============================================================
+# B5F5A5 is a proven TOGGLE. The AC resets its mute state on a real OFF -> ON,
+# so one startup beep is unavoidable on this hardware revision. If the user
+# preference is ON, mute is restored exactly once after the new ON state is
+# confirmed. No repeated B5 is sent on mode/fan/temp changes.
+# ============================================================
+
+script:
+  - id: reapply_mute_after_power_on
+    mode: restart
+    then:
+      - delay: 700ms
+      - if:
+          condition:
+            lambda: |-
+              return
+                id(mute_desired) &&
+                !id(mute_active) &&
+                id(confirmed_mode) != 0;
+          then:
+            - lambda: |-
+                id(mute_active) = true;
+                id(mute_tx_pending) = true;
+                id(mute_ignore_zero_until_ms) = millis() + 1500;
+                ESP_LOGI("AC", "Persistent mute: re-applying B5F5A5 after power-on");
+            - remote_transmitter.transmit_coolix:
+                transmitter_id: ac_ir_tx
+                first: 0xB5F5A5
+
+switch:
+  - platform: template
+    id: mute_switch
+    name: "Без звука"
+
+    lambda: |-
+      return id(mute_desired);
+
+    turn_on_action:
+      - lambda: |-
+          id(mute_desired) = true;
+          id(mute_switch).publish_state(true);
+
+      - if:
+          condition:
+            lambda: |-
+              return id(confirmed_mode) != 0 && !id(mute_active);
+          then:
+            - lambda: |-
+                id(mute_active) = true;
+                id(mute_tx_pending) = true;
+                id(mute_ignore_zero_until_ms) = millis() + 1500;
+                ESP_LOGI("AC", "Mute enabled while AC is ON; sending B5F5A5 once");
+            - remote_transmitter.transmit_coolix:
+                transmitter_id: ac_ir_tx
+                first: 0xB5F5A5
+          else:
+            - lambda: |-
+                ESP_LOGI("AC", "Mute preference enabled while AC is OFF; armed for next power-on");
+
+    turn_off_action:
+      - lambda: |-
+          id(mute_desired) = false;
+          id(mute_switch).publish_state(false);
+
+      - if:
+          condition:
+            lambda: |-
+              return id(confirmed_mode) != 0 && id(mute_active);
+          then:
+            - lambda: |-
+                id(mute_active) = false;
+                id(mute_tx_pending) = true;
+                id(mute_ignore_zero_until_ms) = millis() + 1500;
+                ESP_LOGI("AC", "Mute disabled while AC is ON; sending B5F5A5 once");
+            - remote_transmitter.transmit_coolix:
+                transmitter_id: ac_ir_tx
+                first: 0xB5F5A5
+          else:
+            - lambda: |-
+                id(mute_active) = false;
+                id(mute_tx_pending) = false;
+                ESP_LOGI("AC", "Mute preference disabled; no toggle needed while AC is OFF");
+
+# ============================================================
+# CLIMATE
+# ============================================================
+
+climate:
+  - platform: coolix
+
+    id: ac_climate
+    name: "Кондиционер"
+
+    transmitter_id: ac_ir_tx
+
+    supports_cool: true
+    supports_heat: true
+
+    visual:
+      min_temperature: 17
+      max_temperature: 30
+      temperature_step: 1
+
+    # --------------------------------------------------------
+    # User-control corrections before Coolix packet is sent.
+    #
+    # 1) Remember fan speed in normal fan-controllable modes.
+    # 2) On a pure mode change, inject remembered fan speed.
+    # 3) COOL -> HEAT = 30°C.
+    # 4) HEAT -> COOL = 25°C.
+    #
+    # AUTO/DRY in Coolix physically use AUTO fan. We do not
+    # overwrite preferred_fan there, so the previous speed is
+    # restored after leaving AUTO/DRY.
+    # --------------------------------------------------------
+
+    on_control:
+      - lambda: |-
+          auto requested_mode = x.get_mode();
+          auto requested_fan = x.get_fan_mode();
+
+          climate::ClimateMode effective_mode = id(ac_climate)->mode;
+          if (requested_mode.has_value())
+            effective_mode = *requested_mode;
+
+          // If user explicitly changes fan in COOL / HEAT / FAN_ONLY,
+          // remember that choice.
+          if (
+            requested_fan.has_value() &&
+            (
+              effective_mode == climate::CLIMATE_MODE_COOL ||
+              effective_mode == climate::CLIMATE_MODE_HEAT ||
+              effective_mode == climate::CLIMATE_MODE_FAN_ONLY
+            )
+          ) {
+            switch (*requested_fan) {
+              case climate::CLIMATE_FAN_LOW:
+                id(preferred_fan) = 1;
+                break;
+
+              case climate::CLIMATE_FAN_MEDIUM:
+                id(preferred_fan) = 2;
+                break;
+
+              case climate::CLIMATE_FAN_HIGH:
+                id(preferred_fan) = 3;
+                break;
+
+              case climate::CLIMATE_FAN_AUTO:
+              default:
+                id(preferred_fan) = 0;
+                break;
+            }
+          }
+
+          if (requested_mode.has_value()) {
+            climate::ClimateMode old_mode = id(ac_climate)->mode;
+            climate::ClimateMode new_mode = *requested_mode;
+
+            // Requested default temperatures for direct transitions.
+            if (
+              old_mode == climate::CLIMATE_MODE_COOL &&
+              new_mode == climate::CLIMATE_MODE_HEAT
+            ) {
+              x.set_target_temperature(30.0f);
+            }
+            else if (
+              old_mode == climate::CLIMATE_MODE_HEAT &&
+              new_mode == climate::CLIMATE_MODE_COOL
+            ) {
+              x.set_target_temperature(25.0f);
+            }
+
+            // In the modes where fan speed is actually selectable,
+            // preserve/restore the remembered fan if HA did not send
+            // a fan change in this same call.
+            if (
+              !requested_fan.has_value() &&
+              (
+                new_mode == climate::CLIMATE_MODE_COOL ||
+                new_mode == climate::CLIMATE_MODE_HEAT ||
+                new_mode == climate::CLIMATE_MODE_FAN_ONLY
+              )
+            ) {
+              switch (id(preferred_fan)) {
+                case 1:
+                  x.set_fan_mode(climate::CLIMATE_FAN_LOW);
+                  break;
+
+                case 2:
+                  x.set_fan_mode(climate::CLIMATE_FAN_MEDIUM);
+                  break;
+
+                case 3:
+                  x.set_fan_mode(climate::CLIMATE_FAN_HIGH);
+                  break;
+
+                default:
+                  x.set_fan_mode(climate::CLIMATE_FAN_AUTO);
+                  break;
+              }
+            }
+          }
+
+# ============================================================
+# BLUE: MAIN -> DISPLAY
+# Software UART decoder via RMT, 2400 8N2
+# ============================================================
+
+remote_receiver:
+  id: cn18_main_receiver
+
+  pin:
+    number: GPIO20
+    mode:
+      input: true
+      pullup: false
+
+  filter: 50us
+  idle: 15ms
+  tolerance: 30%
+  buffer_size: 10kB
+
+  on_raw:
+    then:
+      - lambda: |-
+          constexpr float BIT_US = 1000000.0f / 2400.0f;
+          constexpr int FRAME_BITS = 11;
+
+          std::vector<uint8_t> bits;
+          bits.reserve(512);
+
+          for (auto duration : x) {
+            float us = fabsf((float) duration);
+            int count = (int) lroundf(us / BIT_US);
+
+            if (count < 1)
+              count = 1;
+
+            if (count > 40)
+              count = 40;
+
+            uint8_t value = duration > 0 ? 1 : 0;
+
+            for (int i = 0; i < count; i++)
+              bits.push_back(value);
+          }
+
+          for (int i = 0; i < 4; i++)
+            bits.push_back(1);
+
+          bool found_frame = false;
+          std::vector<uint8_t> valid_frame;
+
+          for (
+            int offset = 0;
+            offset < FRAME_BITS && !found_frame;
+            offset++
+          ) {
+            std::vector<int16_t> decoded;
+
+            for (
+              size_t pos = offset;
+              pos + 8 < bits.size();
+              pos += FRAME_BITS
+            ) {
+              if (bits[pos] != 0) {
+                decoded.push_back(-1);
+                continue;
+              }
+
+              uint8_t value = 0;
+
+              for (int bit = 0; bit < 8; bit++) {
+                if (bits[pos + 1 + bit])
+                  value |= (1U << bit);
+              }
+
+              if (pos + 10 < bits.size()) {
+                if (
+                  bits[pos + 9] != 1 ||
+                  bits[pos + 10] != 1
+                ) {
+                  decoded.push_back(-1);
+                  continue;
+                }
+              }
+
+              decoded.push_back(value);
+            }
+
+            for (
+              size_t i = 0;
+              i + 3 < decoded.size();
+              i++
+            ) {
+              if (decoded[i] < 0)
+                continue;
+
+              uint8_t start = (uint8_t) decoded[i];
+
+              if (
+                start != 0x55 &&
+                start != 0xAA
+              )
+                continue;
+
+              if (decoded[i + 1] < 0)
+                continue;
+
+              uint8_t pid = (uint8_t) decoded[i + 1];
+
+              if (
+                pid != 0x90 &&
+                pid != 0x91
+              )
+                continue;
+
+              if (decoded[i + 2] < 0)
+                continue;
+
+              uint8_t len = (uint8_t) decoded[i + 2];
+
+              if (len > 64)
+                continue;
+
+              size_t checksum_index = i + 3 + len;
+
+              if (checksum_index >= decoded.size())
+                continue;
+
+              bool bytes_ok = true;
+              uint16_t sum = 0;
+
+              for (
+                size_t p = i;
+                p <= checksum_index;
+                p++
+              ) {
+                if (decoded[p] < 0) {
+                  bytes_ok = false;
+                  break;
+                }
+
+                sum += (uint8_t) decoded[p];
+              }
+
+              if (!bytes_ok)
+                continue;
+
+              if ((sum & 0xFF) != 0)
+                continue;
+
+              valid_frame.clear();
+
+              for (
+                size_t p = i;
+                p <= checksum_index;
+                p++
+              ) {
+                valid_frame.push_back((uint8_t) decoded[p]);
+              }
+
+              found_frame = true;
+              break;
+            }
+          }
+
+          if (!found_frame)
+            return;
+
+          // --------------------------------------------------
+          // 55 91 transient response: swing ON/OFF
+          // --------------------------------------------------
+
+          if (
+            valid_frame.size() >= 12 &&
+            valid_frame[0] == 0x55 &&
+            valid_frame[1] == 0x91 &&
+            valid_frame[2] == 0x08
+          ) {
+            const uint8_t *p = &valid_frame[3];
+
+            if (
+              p[0] == 0x3F &&
+              p[1] == 0x37
+            ) {
+              id(confirmed_swing) = true;
+              id(ac_climate)->swing_mode =
+                  climate::CLIMATE_SWING_VERTICAL;
+              id(ac_climate)->publish_state();
+            }
+            else if (
+              p[0] == 0x3F &&
+              p[1] == 0x71
+            ) {
+              id(confirmed_swing) = false;
+              id(ac_climate)->swing_mode =
+                  climate::CLIMATE_SWING_OFF;
+              id(ac_climate)->publish_state();
+            }
+
+            return;
+          }
+
+          // --------------------------------------------------
+          // 55 90 real state from MAIN
+          // --------------------------------------------------
+
+          if (
+            valid_frame.size() != 24 ||
+            valid_frame[0] != 0x55 ||
+            valid_frame[1] != 0x90 ||
+            valid_frame[2] != 0x14
+          )
+            return;
+
+          const uint8_t *payload = &valid_frame[3];
+          const uint8_t *m = &payload[12];
+
+          bool all_zero = true;
+
+          for (int i = 0; i < 8; i++) {
+            if (m[i] != 0x00) {
+              all_zero = false;
+              break;
+            }
+          }
+
+          if (all_zero) {
+            // B5F5A5 blanks the front display and MAIN then reports an all-zero
+            // visual state on BLUE even though the AC is still running.
+            // Ignore that only while mute is physically active or during the
+            // short B5 transition window.
+            if (
+              id(mute_active) ||
+              ((int32_t) (id(mute_ignore_zero_until_ms) - millis()) > 0)
+            )
+              return;
+
+            id(confirmed_mode) = 0;
+            id(confirmed_swing) = false;
+            id(mute_active) = false;
+            id(mute_tx_pending) = false;
+
+            id(ac_climate)->mode =
+                climate::CLIMATE_MODE_OFF;
+
+            id(ac_climate)->swing_mode =
+                climate::CLIMATE_SWING_OFF;
+
+            id(ac_climate)->publish_state();
+            return;
+          }
+
+          bool was_off_before_blue = (id(confirmed_mode) == 0);
+
+          if (m[5] == 0x80) {
+            id(confirmed_mode) = 3;
+          }
+          else if (m[5] == 0x00) {
+            id(confirmed_mode) = 4;
+          }
+          else if (m[5] == 0x40) {
+            if (id(confirmed_mode) != 5)
+              id(confirmed_mode) = 2;
+          }
+
+          float decoded_temp = NAN;
+
+          struct TempCode {
+            uint8_t a;
+            uint8_t b;
+            uint8_t temp;
+          };
+
+          static const TempCode TEMP_TABLE[] = {
+            {0x06, 0x07, 17},
+            {0x06, 0x7F, 18},
+            {0x06, 0x6F, 19},
+            {0x5B, 0x3F, 20},
+            {0x5B, 0x06, 21},
+            {0x5B, 0x5B, 22},
+            {0x5B, 0x4F, 23},
+            {0x5B, 0x66, 24},
+            {0x5B, 0x6D, 25},
+            {0x5B, 0x7D, 26},
+            {0x5B, 0x07, 27},
+            {0x5B, 0x7F, 28},
+            {0x5B, 0x6F, 29},
+            {0x4F, 0x3F, 30}
+          };
+
+          if (
+            id(confirmed_mode) == 2 ||
+            id(confirmed_mode) == 3
+          ) {
+            for (auto &entry : TEMP_TABLE) {
+              if (
+                entry.a == m[0] &&
+                entry.b == m[1]
+              ) {
+                decoded_temp = (float) entry.temp;
+                break;
+              }
+            }
+          }
+
+          if (!std::isnan(decoded_temp))
+            id(confirmed_temperature) = decoded_temp;
+
+          switch (id(confirmed_mode)) {
+            case 2:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_COOL;
+              break;
+
+            case 3:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_HEAT;
+              break;
+
+            case 4:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_FAN_ONLY;
+              break;
+
+            case 5:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_DRY;
+              break;
+
+            case 1:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_HEAT_COOL;
+              break;
+
+            default:
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_OFF;
+              break;
+          }
+
+          id(ac_climate)->target_temperature =
+              id(confirmed_temperature);
+
+          switch (id(confirmed_fan)) {
+            case 1:
+              id(ac_climate)->fan_mode =
+                  climate::CLIMATE_FAN_LOW;
+              break;
+
+            case 2:
+              id(ac_climate)->fan_mode =
+                  climate::CLIMATE_FAN_MEDIUM;
+              break;
+
+            case 3:
+              id(ac_climate)->fan_mode =
+                  climate::CLIMATE_FAN_HIGH;
+              break;
+
+            default:
+              id(ac_climate)->fan_mode =
+                  climate::CLIMATE_FAN_AUTO;
+              break;
+          }
+
+          id(ac_climate)->swing_mode =
+              id(confirmed_swing)
+                ? climate::CLIMATE_SWING_VERTICAL
+                : climate::CLIMATE_SWING_OFF;
+
+          id(ac_climate)->publish_state();
+
+          // Fallback path for compact 11-byte commands: if YELLOW did not
+          // update the state first, BLUE itself confirms the real OFF -> ON.
+          if (
+            was_off_before_blue &&
+            id(confirmed_mode) != 0 &&
+            id(mute_desired) &&
+            !id(mute_active)
+          ) {
+            id(reapply_mute_after_power_on).execute();
+          }
+
+# ============================================================
+# YELLOW: DISPLAY -> MAIN
+# Hardware UART 2400 8N1
+# Captures accepted Coolix commands from stock remote and ESP
+# ============================================================
+
+uart:
+  - id: cn18_display_to_main
+
+    rx_pin:
+      number: GPIO4
+      inverted: false
+      mode:
+        input: true
+        pullup: false
+
+    baud_rate: 2400
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 1024
+
+    debug:
+      direction: RX
+      dummy_receiver: true
+
+      after:
+        timeout: 20ms
+
+      sequence:
+        - lambda: |-
+            // -------------------------------------------------
+            // Compact 11-byte AA 91 07 frame.
+            // Proven on this unit for B5F5A5, OFF and normal Coolix commands.
+            // We only consume the cases needed for stable persistent mute;
+            // all climate decoding below remains the original v1.2 path.
+            // -------------------------------------------------
+            if (
+              bytes.size() == 11 &&
+              bytes[0] == 0xAA &&
+              bytes[1] == 0x91 &&
+              bytes[2] == 0x07
+            ) {
+              uint16_t compact_sum = 0;
+              for (uint8_t b : bytes)
+                compact_sum += b;
+
+              if (
+                (compact_sum & 0xFF) == 0 &&
+                ((uint8_t) (bytes[3] ^ bytes[4])) == 0xFF &&
+                ((uint8_t) (bytes[5] ^ bytes[6])) == 0xFF &&
+                ((uint8_t) (bytes[7] ^ bytes[8])) == 0xFF
+              ) {
+                uint32_t compact_code =
+                    ((uint32_t) bytes[3] << 16) |
+                    ((uint32_t) bytes[5] << 8) |
+                    ((uint32_t) bytes[7]);
+
+                // Proven display/sound toggle.
+                if (compact_code == 0xB5F5A5) {
+                  if (id(confirmed_mode) != 0) {
+                    if (id(mute_tx_pending)) {
+                      // Our own toggle: the target state was already applied
+                      // optimistically before transmission to protect BLUE.
+                      id(mute_tx_pending) = false;
+                    }
+                    else {
+                      // Stock remote / external B5: follow the real physical state
+                      // and make it the new persistent user preference.
+                      id(mute_active) = !id(mute_active);
+                      id(mute_desired) = id(mute_active);
+                      id(mute_switch).publish_state(id(mute_desired));
+                    }
+
+                    ESP_LOGI(
+                      "AC",
+                      "Display/Sound toggle confirmed; mute is %s",
+                      id(mute_active) ? "ON" : "OFF"
+                    );
+                  }
+                  return;
+                }
+
+                // OFF must always clear runtime mute. This is essential because
+                // BLUE all-zero is intentionally ignored while mute is active.
+                if (compact_code == 0xB27BE0) {
+                  id(confirmed_mode) = 0;
+                  id(confirmed_swing) = false;
+                  id(mute_active) = false;
+                  id(mute_tx_pending) = false;
+                  id(mute_ignore_zero_until_ms) = 0;
+
+                  id(ac_climate)->mode = climate::CLIMATE_MODE_OFF;
+                  id(ac_climate)->swing_mode = climate::CLIMATE_SWING_OFF;
+                  id(ac_climate)->publish_state();
+                  ESP_LOGI("AC", "Accepted compact OFF: 0xB27BE0");
+                  return;
+                }
+              }
+
+              // Other compact commands are left to the proven BLUE state parser.
+              return;
+            }
+
+            if (bytes.size() < 17)
+              return;
+
+            if (
+              bytes[0] != 0xAA ||
+              bytes[1] != 0x91 ||
+              bytes[2] != 0x0D
+            )
+              return;
+
+            uint16_t sum = 0;
+
+            for (uint8_t b : bytes)
+              sum += b;
+
+            if ((sum & 0xFF) != 0)
+              return;
+
+            if (
+              ((uint8_t) (bytes[3] ^ bytes[4])) != 0xFF ||
+              ((uint8_t) (bytes[5] ^ bytes[6])) != 0xFF ||
+              ((uint8_t) (bytes[7] ^ bytes[8])) != 0xFF
+            )
+              return;
+
+            if (
+              bytes[3] != bytes[9] ||
+              bytes[5] != bytes[11] ||
+              bytes[7] != bytes[13]
+            )
+              return;
+
+            uint32_t code =
+                ((uint32_t) bytes[3] << 16) |
+                ((uint32_t) bytes[5] << 8) |
+                ((uint32_t) bytes[7]);
+
+            ESP_LOGI(
+              "AC",
+              "Accepted Coolix: 0x%06lX",
+              (unsigned long) code
+            );
+
+            // -------------------------------------------------
+            // OFF
+            // -------------------------------------------------
+
+            if (code == 0xB27BE0) {
+              id(confirmed_mode) = 0;
+              id(confirmed_swing) = false;
+              id(mute_active) = false;
+              id(mute_tx_pending) = false;
+              id(mute_ignore_zero_until_ms) = 0;
+
+              id(ac_climate)->mode =
+                  climate::CLIMATE_MODE_OFF;
+
+              id(ac_climate)->swing_mode =
+                  climate::CLIMATE_SWING_OFF;
+
+              id(ac_climate)->publish_state();
+              return;
+            }
+
+            // -------------------------------------------------
+            // SWING TOGGLE
+            // -------------------------------------------------
+
+            if (code == 0xB26BE0) {
+              id(confirmed_swing) =
+                  !id(confirmed_swing);
+
+              id(ac_climate)->swing_mode =
+                  id(confirmed_swing)
+                    ? climate::CLIMATE_SWING_VERTICAL
+                    : climate::CLIMATE_SWING_OFF;
+
+              id(ac_climate)->publish_state();
+              return;
+            }
+
+            if ((code & 0xFF0000) != 0xB20000)
+              return;
+
+            bool was_off_before_yellow = (id(confirmed_mode) == 0);
+
+            uint32_t fan_bits = code & 0xF000;
+            uint8_t mode_bits = code & 0x0C;
+
+            // -------------------------------------------------
+            // MODE
+            // -------------------------------------------------
+
+            if (mode_bits == 0x0C) {
+              id(confirmed_mode) = 3;
+            }
+            else if (mode_bits == 0x08) {
+              id(confirmed_mode) = 1;
+            }
+            else if (mode_bits == 0x04) {
+              if (fan_bits == 0x1000)
+                id(confirmed_mode) = 5;
+              else
+                id(confirmed_mode) = 4;
+            }
+            else {
+              id(confirmed_mode) = 2;
+            }
+
+            // -------------------------------------------------
+            // FAN
+            // -------------------------------------------------
+
+            if (
+              fan_bits == 0xB000 ||
+              fan_bits == 0x1000
+            ) {
+              id(confirmed_fan) = 0;
+            }
+            else if (fan_bits == 0x9000) {
+              id(confirmed_fan) = 1;
+            }
+            else if (fan_bits == 0x5000) {
+              id(confirmed_fan) = 2;
+            }
+            else if (fan_bits == 0x3000) {
+              id(confirmed_fan) = 3;
+            }
+
+            // Preserve the user's real fan choice from the stock remote
+            // or from our own accepted command. Do not erase it in modes
+            // that force AUTO fan.
+            if (
+              id(confirmed_mode) == 2 ||
+              id(confirmed_mode) == 3 ||
+              id(confirmed_mode) == 4
+            ) {
+              id(preferred_fan) = id(confirmed_fan);
+            }
+
+            // -------------------------------------------------
+            // TEMPERATURE
+            // -------------------------------------------------
+
+            if (id(confirmed_mode) != 4) {
+              uint8_t t = code & 0xF0;
+
+              switch (t) {
+                case 0x00:
+                  id(confirmed_temperature) = 17;
+                  break;
+
+                case 0x10:
+                  id(confirmed_temperature) = 18;
+                  break;
+
+                case 0x30:
+                  id(confirmed_temperature) = 19;
+                  break;
+
+                case 0x20:
+                  id(confirmed_temperature) = 20;
+                  break;
+
+                case 0x60:
+                  id(confirmed_temperature) = 21;
+                  break;
+
+                case 0x70:
+                  id(confirmed_temperature) = 22;
+                  break;
+
+                case 0x50:
+                  id(confirmed_temperature) = 23;
+                  break;
+
+                case 0x40:
+                  id(confirmed_temperature) = 24;
+                  break;
+
+                case 0xC0:
+                  id(confirmed_temperature) = 25;
+                  break;
+
+                case 0xD0:
+                  id(confirmed_temperature) = 26;
+                  break;
+
+                case 0x90:
+                  id(confirmed_temperature) = 27;
+                  break;
+
+                case 0x80:
+                  id(confirmed_temperature) = 28;
+                  break;
+
+                case 0xA0:
+                  id(confirmed_temperature) = 29;
+                  break;
+
+                case 0xB0:
+                  id(confirmed_temperature) = 30;
+                  break;
+              }
+            }
+
+            // -------------------------------------------------
+            // PUBLISH ACCEPTED COMMAND
+            // -------------------------------------------------
+
+            switch (id(confirmed_mode)) {
+              case 1:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_HEAT_COOL;
+                break;
+
+              case 2:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_COOL;
+                break;
+
+              case 3:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_HEAT;
+                break;
+
+              case 4:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_FAN_ONLY;
+                break;
+
+              case 5:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_DRY;
+                break;
+
+              default:
+                id(ac_climate)->mode =
+                    climate::CLIMATE_MODE_OFF;
+                break;
+            }
+
+            id(ac_climate)->target_temperature =
+                id(confirmed_temperature);
+
+            switch (id(confirmed_fan)) {
+              case 1:
+                id(ac_climate)->fan_mode =
+                    climate::CLIMATE_FAN_LOW;
+                break;
+
+              case 2:
+                id(ac_climate)->fan_mode =
+                    climate::CLIMATE_FAN_MEDIUM;
+                break;
+
+              case 3:
+                id(ac_climate)->fan_mode =
+                    climate::CLIMATE_FAN_HIGH;
+                break;
+
+              default:
+                id(ac_climate)->fan_mode =
+                    climate::CLIMATE_FAN_AUTO;
+                break;
+            }
+
+            id(ac_climate)->swing_mode =
+                id(confirmed_swing)
+                  ? climate::CLIMATE_SWING_VERTICAL
+                  : climate::CLIMATE_SWING_OFF;
+
+            id(ac_climate)->publish_state();
+
+            // Real OFF -> ON accepted on the original full YELLOW frame path.
+            // Restore persistent mute once, never on ordinary mode/fan/temp changes.
+            if (
+              was_off_before_yellow &&
+              id(confirmed_mode) != 0 &&
+              id(mute_desired) &&
+              !id(mute_active)
+            ) {
+              id(reapply_mute_after_power_on).execute();
+            }
