@@ -2,16 +2,16 @@
 
 ## v1.5 — 2026-09-15
 
-- Fixed persistent `Без звука` state after Home Assistant restart and ESPHome API reconnect.
-- Added `restore_mode: DISABLED` for the mute template switch.
-- Restored `mute_desired` is republished after ESP boot and API reconnect without sending `B5F5A5`.
-- Climate mode, fan, temperature and bus-decoding logic from v1.4 remains unchanged.
-- Verified on 2026-09-15: `Без звука = ON` remains ON after Home Assistant Core restart.
-- Added troubleshooting notes for OTA rollback and brownout diagnostics.
+- Исправлено сохранение состояния `Без звука` после перезапуска Home Assistant и переподключения ESPHome API.
+- Для template-switch добавлен `restore_mode: DISABLED`.
+- `mute_desired` повторно публикуется после загрузки ESP и подключения API-клиента без отправки `B5F5A5`.
+- Логика режимов, вентилятора, температуры и декодирования из v1.4 не изменялась.
+- Проверено 15.09.2026: при `Без звука = ON` обычный «Перезапуск Home Assistant» сохраняет состояние ON.
+- Добавлена отдельная инструкция по диагностике OTA-отката и проблем питания.
 
 ## v1.4
 
-- Stable climate logic based on the physically verified v1.2 implementation.
-- AUTO / HEAT_COOL enabled.
-- Fan speed remembered across mode changes.
-- Persistent mute preference with one reapply after real OFF → ON.
+- Стабильная климатическая логика на базе физически проверенной v1.2.
+- AUTO / HEAT_COOL оставлен включённым.
+- Скорость вентилятора запоминается между режимами.
+- Добавлено постоянное пользовательское состояние `Без звука` с однократным повторным применением после настоящего OFF → ON.
