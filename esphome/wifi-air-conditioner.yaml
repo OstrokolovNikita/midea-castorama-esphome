@@ -1,11 +1,20 @@
 # ============================================================
 # MIDEA / CASTORAMA
 # ESP32-C3 Super Mini
-# v1.4 FINAL
-# Base: physically verified v1.2.
-# Added only stable persistent mute handling.
+# v1.5 MUTE PERSISTENCE FIX
+# Base: v1.4 FINAL / physically verified v1.2 climate logic.
+# Climate/mode/fan decoding and control logic are unchanged from v1.4.
+# This revision only fixes persistence/publication of the "Без звука" preference.
 #
-# Changes:
+# v1.5 changes:
+# - template mute switch restore is DISABLED so ESPHome cannot execute
+#   turn_off_action during switch setup and erase restored mute_desired
+# - restored mute_desired is explicitly published after ESP boot
+# - mute_desired is explicitly re-published whenever an API client reconnects
+# - API/HA reconnect only publishes state; it NEVER sends B5F5A5 by itself
+# - verified on 2026-09-15: Home Assistant Core restart preserves mute ON state
+#
+# Existing v1.4 behavior kept:
 # - HEAT_COOL in HA = AUTO mode (kept enabled)
 # - fan speed is remembered across mode changes
 # - DRY/AUTO may physically force AUTO fan, but the last normal
@@ -23,6 +32,16 @@ esphome:
   name: wifi-air-conditioner
   friendly_name: Wifi air conditioner
 
+  # Publish the already-restored mute preference only after all components
+  # are initialized. This does not send any command to the air conditioner.
+  on_boot:
+    - priority: -100
+      then:
+        - lambda: |-
+            id(mute_switch).publish_state(id(mute_desired));
+            ESP_LOGI("AC", "Boot: mute preference published as %s",
+                     id(mute_desired) ? "ON" : "OFF");
+
 esp32:
   variant: esp32c3
   framework:
@@ -35,6 +54,14 @@ logger:
 api:
   encryption:
     key: !secret api_encryption_key
+
+  # A Home Assistant restart must not change the preference.
+  # Reconnection only republishes the local persistent value.
+  on_client_connected:
+    - lambda: |-
+        id(mute_switch).publish_state(id(mute_desired));
+        ESP_LOGI("AC", "API reconnect: mute preference re-published as %s",
+                 id(mute_desired) ? "ON" : "OFF");
 
 ota:
   - platform: esphome
@@ -170,6 +197,13 @@ switch:
   - platform: template
     id: mute_switch
     name: "Без звука"
+
+    # CRITICAL: the preference is owned by mute_desired.
+    # With the normal switch restore behavior, TemplateSwitch::setup() can
+    # execute turn_off_action during boot and overwrite restored mute_desired.
+    # DISABLED prevents any boot-time ON/OFF action; lambda below publishes
+    # the canonical value instead.
+    restore_mode: DISABLED
 
     lambda: |-
       return id(mute_desired);
